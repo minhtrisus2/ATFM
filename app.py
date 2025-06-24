@@ -9,8 +9,8 @@ import random
 st.set_page_config(page_title="ATFM Simulation Dashboard - VVTS (Hoàn Chỉnh)", layout="wide")
 
 VVTS_CONFIG = {
-    "takeoff_capacity_hourly": 26,  # Năng lực cất cánh mặc định mỗi giờ
-    "landing_capacity_hourly": 26,  # Năng lực hạ cánh mặc định mỗi giờ
+    "takeoff_capacity_hourly": 24,  # Năng lực cất cánh mặc định mỗi giờ
+    "landing_capacity_hourly": 24,  # Năng lực hạ cánh mặc định mỗi giờ
     "taxi_out_time_minutes": 15,    # Thời gian lăn bánh ra từ cổng đến đường băng (cho DEP từ VVTS)
     "min_separation_minutes": 2,    # Khoảng cách thời gian tối thiểu giữa 2 lượt cất/hạ cánh
     "airport_timezone_offset_hours": 7 # Múi giờ của sân bay (UTC+7 cho VN)
