@@ -4,7 +4,7 @@ import random
 import string 
 
 # --- Cấu hình Tạo Dữ liệu ---
-NUM_FLIGHTS = 1800 # Tăng số lượng chuyến bay để tạo nhiều tình huống tắc nghẽn
+NUM_FLIGHTS = 1002 # Tăng số lượng chuyến bay để tạo nhiều tình huống tắc nghẽn
 NUM_DAYS = 7      # Mô phỏng trong 7 ngày liên tiếp
 
 # Sân bay Tân Sơn Nhất
