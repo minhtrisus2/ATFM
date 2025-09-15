@@ -4,6 +4,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta, time, date
 import os
 import random
+import heapq
 
 # --- Cấu hình trang và Hằng số Toàn cục ---
 st.set_page_config(page_title="ATFM Simulation Dashboard - VVTS (Hoàn Chỉnh)", layout="wide")
@@ -23,7 +24,7 @@ def get_empty_display_dataframe_schema():
         'eobt_dt_local': 'datetime64[ns]', 'eobt_dt_utc': 'datetime64[ns]',
         'eldt_dt_utc': 'datetime64[ns]', 'eet_minutes': float, 'eet_delta': 'timedelta64[ns]',
         'cldt_dt_utc': 'datetime64[ns]', 'etot_dt_utc': 'datetime64[ns]',
-        'atfm_delay_minutes': float, 'is_regulated': bool, 'flight_type': str,
+        'atfm_delay_minutes': float, 'is_regulated': bool, 'flight_type': str, 'flight_scope': str,
         'regulated_time_utc': 'datetime64[ns]', 'original_event_time_utc': 'datetime64[ns]',
         'regulated_time_local': 'datetime64[ns]', 'original_event_time_local': 'datetime64[ns]',
         'eobt_dt_local_display': str, 'ctot_new_local': str,
@@ -108,6 +109,12 @@ def load_data():
         for col in ['origin_eet_to_vvts_minutes', 'origin_eet_from_vvts_minutes', 'origin_taxi_in_minutes', 'origin_taxi_out_minutes',
                     'dest_eet_to_vvts_minutes', 'dest_eet_from_vvts_minutes', 'dest_taxi_in_minutes', 'dest_taxi_out_minutes']:
             flights_df[col] = pd.to_numeric(flights_df[col], errors='coerce').fillna(15 if 'taxi' in col else 60)
+
+        # Phân loại chuyến bay nội địa/quốc tế dựa trên mã sân bay
+        flights_df['flight_scope'] = flights_df.apply(
+            lambda row: 'domestic' if str(row['origin']).startswith('VV') and str(row['destination']).startswith('VV') else 'international',
+            axis=1
+        )
 
         return flights_df, eets_df
     except FileNotFoundError:
@@ -214,75 +221,53 @@ def run_gdp_simulation_for_all_traffic(initial_all_traffic_df, takeoff_capacity_
     all_traffic['atfm_delay_minutes'] = 0.0
     all_traffic['is_regulated'] = False
 
-    allocated_slots = []
-    
     # Sắp xếp các chuyến bay theo thời gian dự kiến để xử lý
-    all_traffic = all_traffic.sort_values(by='predicted_event_time_utc').reset_index(drop=True)
+    all_traffic.sort_values(by='predicted_event_time_utc', inplace=True)
+
+    # Chuẩn bị các heap slot cho ARR và DEP
+    start_hour = all_traffic['predicted_event_time_utc'].min().floor('H')
+    end_hour = all_traffic['predicted_event_time_utc'].max().ceil('H') + timedelta(hours=6)
+
+    arrival_slots, departure_slots = [], []
+    current = start_hour
+    while current <= end_hour:
+        arr_cap = landing_capacity_hourly
+        dep_cap = takeoff_capacity_hourly
+        for event in reduced_capacity_events:
+            if event['start_time_utc'] <= current < event['end_time_utc']:
+                total_cap = min(takeoff_capacity_hourly + landing_capacity_hourly, event['new_capacity'])
+                arr_cap = min(landing_capacity_hourly, total_cap // 2)
+                dep_cap = min(takeoff_capacity_hourly, total_cap - arr_cap)
+                break
+        if arr_cap > 0:
+            interval = 60 / arr_cap
+            for i in range(int(arr_cap)):
+                heapq.heappush(arrival_slots, current + timedelta(minutes=i * interval))
+        if dep_cap > 0:
+            interval = 60 / dep_cap
+            for i in range(int(dep_cap)):
+                heapq.heappush(departure_slots, current + timedelta(minutes=i * interval))
+        current += timedelta(hours=1)
 
     for idx, flight in all_traffic.iterrows():
         desired_time = flight['predicted_event_time_utc']
         if pd.isna(desired_time):
             st.warning(f"Bỏ qua chuyến bay {flight.get('callsign', 'N/A')} do thiếu thời gian dự đoán.")
             continue
-
-        found_slot = False
-        # Bắt đầu tìm kiếm từ thời gian mong muốn của chuyến bay
-        check_time = desired_time
-        
-        # Thêm điều kiện dừng để tránh lặp vô hạn
-        loop_limiter = 0
-        max_loops = 50000 
-
-        while not found_slot:
-            loop_limiter += 1
-            if loop_limiter > max_loops:
-                st.error(f"Lỗi: Vòng lặp vô hạn khi tìm slot cho chuyến bay {flight.get('callsign', 'N/A')}. Gán thời gian gốc và tiếp tục.")
-                all_traffic.loc[idx, 'regulated_time_utc'] = desired_time
+        heap = arrival_slots if flight['flight_type'] == 'arrival' else departure_slots
+        slot_time = None
+        while heap:
+            candidate = heapq.heappop(heap)
+            if candidate >= desired_time:
+                slot_time = candidate
                 break
-            
-            # --- BƯỚC 1: KIỂM TRA NĂNG LỰC CỦA CẢ GIỜ ---
-            current_hour = check_time.replace(minute=0, second=0, microsecond=0)
-            
-            # Lấy năng lực hiệu dụng cho giờ này
-            effective_capacity_total = takeoff_capacity_hourly + landing_capacity_hourly
-            for event in reduced_capacity_events:
-                if event['start_time_utc'] <= current_hour < event['end_time_utc']:
-                    effective_capacity_total = min(effective_capacity_total, event['new_capacity'])
-                    break
-            
-            # Đếm số slot đã được cấp trong giờ này
-            demand_in_hour = sum(1 for slot in allocated_slots if slot.date() == current_hour.date() and slot.hour == current_hour.hour)
-
-            if demand_in_hour >= effective_capacity_total:
-                # NẾU GIỜ ĐÃ ĐẦY -> NHẢY ĐẾN ĐẦU GIỜ TIẾP THEO và lặp lại
-                check_time = current_hour + timedelta(hours=1)
-                continue
-
-            # --- BƯỚC 2: NẾU GIỜ CÒN CHỖ, KIỂM TRA KHOẢNG CÁCH PHÚT ---
-            is_separation_ok = True
-            for existing_slot in allocated_slots:
-                time_diff = abs((check_time - existing_slot).total_seconds() / 60)
-                if time_diff < VVTS_CONFIG['min_separation_minutes']:
-                    is_separation_ok = False
-                    break
-            
-            if is_separation_ok:
-                # ĐÃ TÌM THẤY SLOT HỢP LỆ!
-                final_slot_time = check_time
-                
-                # Gán slot và tính toán độ trễ
-                all_traffic.loc[idx, 'regulated_time_utc'] = final_slot_time
-                delay = (final_slot_time - desired_time).total_seconds() / 60
-                if delay > 0.1: # Coi như trễ nếu lớn hơn vài giây
-                    all_traffic.loc[idx, 'atfm_delay_minutes'] = delay
-                    all_traffic.loc[idx, 'is_regulated'] = True
-                
-                allocated_slots.append(final_slot_time)
-                allocated_slots.sort()
-                found_slot = True # Thoát khỏi vòng lặp while
-            else:
-                # Nếu phút này không được, thử phút tiếp theo
-                check_time += timedelta(minutes=1)
+        if slot_time is None:
+            slot_time = desired_time
+        all_traffic.loc[idx, 'regulated_time_utc'] = slot_time
+        delay = (slot_time - desired_time).total_seconds() / 60
+        if delay > 0.1:
+            all_traffic.loc[idx, 'atfm_delay_minutes'] = delay
+            all_traffic.loc[idx, 'is_regulated'] = True
     
     # ----- PHẦN CODE CÒN LẠI CỦA HÀM GIỮ NGUYÊN -----
     df_result_with_display_cols = all_traffic.copy()
@@ -321,26 +306,33 @@ def run_gdp_simulation_for_all_traffic(initial_all_traffic_df, takeoff_capacity_
 def simulate_ctot_compliance(regulated_df):
     """
     Mô phỏng sự tuân thủ CTOT với dung sai -5/+10 phút.
-    Hàm này lấy DataFrame đã được điều tiết và thêm vào một cột 'actual_time_utc'
-    để phản ánh thời gian cất/hạ cánh thực tế có tính đến sự linh hoạt.
+
+    Hàm này lấy DataFrame đã điều tiết và thêm vào các cột:
+      - ``actual_time_utc``: thời gian thực tế sau khi hãng thực hiện.
+      - ``compliance_offset_minutes``: độ lệch so với CTOT.
+      - ``slot_compliance``: đánh dấu tuân thủ (True nếu lệch trong [-5, +10]).
     """
     st.info("Bước cuối: Mô phỏng sự tuân thủ CTOT với dung sai -5/+10 phút...")
-    
+
     df_with_actuals = regulated_df.copy()
-    
-    # Tạo cột mới để chứa thời gian thực tế
+
+    # Khởi tạo các cột mới
     df_with_actuals['actual_time_utc'] = df_with_actuals['regulated_time_utc']
-    
-    # Chỉ áp dụng cho các chuyến bay bị điều tiết
+    df_with_actuals['compliance_offset_minutes'] = 0
+    df_with_actuals['slot_compliance'] = True
+
+    # Chỉ áp dụng lệch cho các chuyến bay bị điều tiết
     regulated_indices = df_with_actuals[df_with_actuals['is_regulated'] == True].index
-    
+
     for index in regulated_indices:
-        # Tạo độ lệch ngẫu nhiên từ -5 đến +10 phút
-        compliance_offset = random.randint(-5, 10)
-        
-        # Cập nhật thời gian thực tế
-        df_with_actuals.loc[index, 'actual_time_utc'] = df_with_actuals.loc[index, 'regulated_time_utc'] + timedelta(minutes=compliance_offset)
-        
+        # Sinh độ lệch ngẫu nhiên rộng hơn để có trường hợp vi phạm
+        compliance_offset = random.randint(-20, 20)
+        df_with_actuals.loc[index, 'actual_time_utc'] = (
+            df_with_actuals.loc[index, 'regulated_time_utc'] + timedelta(minutes=compliance_offset)
+        )
+        df_with_actuals.loc[index, 'compliance_offset_minutes'] = compliance_offset
+        df_with_actuals.loc[index, 'slot_compliance'] = -5 <= compliance_offset <= 10
+
     return df_with_actuals
 
 # --- CẢI TIẾN: Thuật toán GDP 2 bước (Dual-Pass) phiên bản CUỐI CÙNG, SỬA LỖI MẤT DỮ LIỆU ---
@@ -1224,7 +1216,7 @@ with tab_gdp: # Nội dung Tab 3
                     'regulated_time_local': 'CTOT mới',
                     'atfm_delay_minutes': 'Phút trễ'
                 }
-                
+
                 st.dataframe(
                     regulated_departures_df[display_cols_dep.keys()].rename(columns=display_cols_dep),
                     use_container_width=True,
@@ -1235,18 +1227,53 @@ with tab_gdp: # Nội dung Tab 3
             else:
                 st.info("Không có chuyến bay cất cánh nào bị điều tiết.")
 
+        # --- BƯỚC 3B: GIÁM SÁT TUÂN THỦ CTOT ---
+        st.markdown("---")
+        st.subheader("Chuyến bay không tuân thủ CTOT")
+
+        non_compliant_df = df_regulated_full[df_regulated_full['slot_compliance'] == False].copy()
+        non_compliant_df['compliance_offset_minutes'] = non_compliant_df['compliance_offset_minutes'].astype(int)
+
+        if not non_compliant_df.empty:
+            display_cols_nc = {
+                'callsign': 'Số hiệu',
+                'regulated_time_local': 'CTOT yêu cầu',
+                'actual_time_local': 'Giờ thực tế',
+                'compliance_offset_minutes': 'Lệch (phút)'
+            }
+            st.dataframe(
+                non_compliant_df[display_cols_nc.keys()].rename(columns=display_cols_nc),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("Tất cả chuyến bay đã tuân thủ CTOT.")
+
         # --- BƯỚC 4: HIỂN THỊ THỐNG KÊ CHUNG ---
         st.markdown("---")
         st.subheader("Thống kê chung")
-        
+
         total_regulated = df_regulated_full['is_regulated'].sum()
         total_delay = df_regulated_full['atfm_delay_minutes'].sum()
         avg_delay = total_delay / total_regulated if total_regulated > 0 else 0
-        
-        stat_col1, stat_col2, stat_col3 = st.columns(3)
+        non_compliant_count = df_regulated_full[df_regulated_full['slot_compliance'] == False].shape[0]
+
+        stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
         stat_col1.metric("Số chuyến bay bị điều tiết", f"{total_regulated}")
         stat_col2.metric("Tổng phút trễ ATFM", f"{total_delay:,.0f} phút")
-        stat_col3.metric("Độ trễ trung bình", f"{avg_delay:.1f} phút/chuyến")    
+        stat_col3.metric("Độ trễ trung bình", f"{avg_delay:.1f} phút/chuyến")
+        stat_col4.metric("Chuyến bay vi phạm CTOT", f"{non_compliant_count}")
+
+        # Biểu đồ phân bố độ trễ
+        st.subheader("Phân bố độ trễ ATFM")
+        if not regulated_flights_only_df.empty:
+            delay_fig = go.Figure()
+            delay_fig.add_trace(go.Histogram(x=regulated_flights_only_df['atfm_delay_minutes'], nbinsx=20))
+            delay_fig.update_layout(xaxis_title='Độ trễ (phút)', yaxis_title='Số chuyến bay', bargap=0.1)
+            st.plotly_chart(delay_fig, use_container_width=True)
+        else:
+            st.info("Không có chuyến bay bị điều tiết để hiển thị biểu đồ độ trễ.")
+
         # --- BƯỚC 3: HIỂN THỊ BẢNG CHI TIẾT VÀ THỐNG KÊ ---
         st.markdown("---")
         # (Code hiển thị bảng "Chi tiết các chuyến bay bị điều tiết" và "Thống kê chung" giữ nguyên như cũ)
