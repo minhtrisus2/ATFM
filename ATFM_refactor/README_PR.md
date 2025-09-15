@@ -1,51 +1,55 @@
 from __future__ import annotations
 from datetime import datetime, timedelta
-from typing import Optional, Iterator, Dict, Any
-import pandas as pd
+from typing import Iterable, List, Optional
+from collections import defaultdict
+from .models import Flight, CapacityEvent
 
-TIME_FMT_HM = "%H:%M"
-DATE_FMT = "%Y-%m-%d"
+def _effective_params_at(
+    ts: datetime,
+    default_aar: int,
+    default_adr: int,
+    default_sep: int,
+    events: Optional[List[CapacityEvent]],
+):
+    aar, adr, sep = default_aar, default_adr, default_sep
+    if events:
+        for ev in events:
+            if ev.start_time_utc <= ts < ev.end_time_utc:
+                aar, adr, sep = ev.aar, ev.adr, ev.min_sep_minutes
+                break
+    return aar, adr, sep
 
-def parse_schedule_df(df: pd.DataFrame) -> pd.DataFrame:
+def allocate_slots(
+    flights: Iterable[Flight],
+    default_aar: int = 30,
+    default_adr: int = 30,
+    default_min_sep: int = 2,
+    events: Optional[List[CapacityEvent]] = None,
+) -> List[Flight]:
     """
-    Yêu cầu các cột: callsign, origin, destination, eobt, flight_date, aircraft_type
-    eobt: HH:MM (UTC hoặc mốc bạn đang dùng nhất quán)
-    flight_date: YYYY-MM-DD
+    Greedy slot allocator:
+      - Phân biệt AAR (arrival) và ADR (departure).
+      - Separation kiểm tra riêng theo hàng đợi ARR/DEP (không khoá chéo không cần thiết).
+      - Nhảy đầu giờ tiếp theo nếu giờ hiện tại đã đầy theo loại (ARR/DEP).
+      - Giới hạn dịch tối đa 12 giờ để tránh vòng lặp bất tận.
     """
-    required_cols = {"callsign", "origin", "destination", "eobt", "flight_date", "aircraft_type"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"Thiếu cột bắt buộc trong schedule CSV: {missing}")
-    # Chuẩn hoá chuỗi
-    for col in ["callsign", "origin", "destination", "eobt", "flight_date", "aircraft_type"]:
-        df[col] = df[col].astype(str).str.strip()
-    return df
+    flights_sorted = sorted(list(flights), key=lambda f: (f.eobt_utc, f.callsign))
+    allocated_arr: List[datetime] = []
+    allocated_dep: List[datetime] = []
 
-def _load_eets(path: Optional[str]) -> Optional[pd.DataFrame]:
-    """
-    eets.csv: airport_code,eet_to_vvts_minutes,eet_from_vvts_minutes,taxi_in_minutes,taxi_out_minutes
-    """
-    if not path:
-        return None
-    try:
-        df = pd.read_csv(path)
-        required = {"airport_code","eet_to_vvts_minutes","eet_from_vvts_minutes","taxi_in_minutes","taxi_out_minutes"}
-        if not required.issubset(df.columns):
-            return None
-        # chuẩn hoá code
-        df["airport_code"] = df["airport_code"].astype(str).str.strip().str.upper()
-        return df
-    except Exception:
-        return None
+    hourly_counts_arr = defaultdict(int)  # {(Y,M,D,H): count}
+    hourly_counts_dep = defaultdict(int)
 
-def flight_dicts_from_df(
-    df: pd.DataFrame,
-    eets_csv_path: Optional[str] = "eets.csv",
-) -> Iterator[Dict[str, Any]]:
-    """
-    Với flight ARRIVAL (destination == 'VVTS'):
-      - Xác định ETA = (flight_date + eobt [đang là giờ rời chỗ giả định]) + EET_to_VVTS + taxi_in
-      - Nếu không tìm thấy airport trong eets.csv → giữ nguyên mốc ban đầu, UI sẽ cảnh báo.
-    Với flight DEPARTURE (origin == 'VVTS'):
-      - Giữ eobt_utc như file schedule (mốc off-block).
-    """
+    MAX_SHIFT_MINUTES = 12 * 60
+
+    for f in flights_sorted:
+        t = f.eobt_utc.replace(second=0, microsecond=0)
+        shifted = 0
+        while shifted <= MAX_SHIFT_MINUTES:
+            aar, adr, sep = _effective_params_at(t, default_aar, default_adr, default_min_sep, events)
+            hour_key = (t.year, t.month, t.day, t.hour)
+
+            if f.is_arrival:
+                hour_demand = hourly_counts_arr[hour_key]
+                cap = aar
+                seq = a
